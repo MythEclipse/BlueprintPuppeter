@@ -67,7 +67,7 @@ const fetchWithProxy = async (url: string): Promise<any> => {
 
 // Contoh penggunaan
 (async () => {
-    const targetUrl = "https://api.ipify.org?format=json"; // URL target untuk testing
+    const targetUrl = "https://httpbin.org/ip"; // URL target untuk testing
     try {
         const result = await fetchWithProxy(targetUrl);
         console.log("Hasil fetch:", result);
