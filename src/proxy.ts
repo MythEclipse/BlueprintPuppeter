@@ -1,81 +1,41 @@
-import axios from "axios";
-import https from "https";
+import puppeteer from 'puppeteer';
 
-const PROXY_LIST_URL = "https://raw.githubusercontent.com/MythEclipse/Auto-Proxy-Fetcher/refs/heads/main/proxies.txt";
-
-const getProxies = async (): Promise<string[]> => {
-    try {
-        const response = await axios.get(PROXY_LIST_URL);
-        return response.data
-            .split("\n")
-            .filter((proxy: string) => proxy.trim() !== "" && !proxy.startsWith("#") && /\d+\.\d+\.\d+\.\d+:\d+/.test(proxy));
-    } catch (error) {
-        if (error instanceof Error) {
-            throw new Error(`Gagal mengambil daftar proxy: ${error.message}`);
-        }
-        throw new Error("Gagal mengambil daftar proxy: Kesalahan tak terduga.");
-    }
-};
-
-const fetchWithProxy = async (url: string): Promise<any> => {
-    const proxies = await getProxies();
-    if (proxies.length === 0) {
-        throw new Error("Tidak ada proxy yang tersedia.");
-    }
-
-    for (let i = 0; i < proxies.length; i++) {
-        const proxy = proxies[i];
-        if (!proxy) {
-            console.error("Proxy tidak ditemukan.");
-            continue;
-        }
-
-        const [host, port] = proxy.split(":");
-
-        if (!host || !port) {
-            console.error(`Proxy tidak valid: ${proxy}`);
-            continue;
-        }
-
-        try {
-            // Buat https agent untuk menonaktifkan verifikasi sertifikat SSL
-            const agent = new https.Agent({ rejectUnauthorized: false });
-
-            // Konfigurasi Axios dengan proxy dan agent
-            const axiosInstance = axios.create({
-                proxy: {
-                    host,
-                    port: parseInt(port, 10),
-                },
-                httpsAgent: agent, // Menonaktifkan verifikasi sertifikat
-                timeout: 1000,
-            });
-
-            const response = await axiosInstance.get(url);
-            return response.data;
-        } catch (error) {
-            if (error instanceof Error) {
-                console.log(`Gagal menggunakan proxy ${proxy}: ${error.message}`);
-            } else {
-                console.log(`Gagal menggunakan proxy ${proxy}: Error tak terduga.`);
-            }
-        }
-    }
-
-    throw new Error("Semua percobaan dengan proxy gagal.");
-};
-
-// Contoh penggunaan
 (async () => {
-    const targetUrl = "https://httpbin.org/ip"; // URL target untuk testing
-    try {
-        const result = await fetchWithProxy(targetUrl);
-        console.log("Hasil fetch:", result);
-    } catch (error) {
-        if (error instanceof Error) {
-            console.error(error.message);
-        } else {
-            console.error("Unknown error occurred");
-        }
-    }
+    const browser = await puppeteer.launch({ headless: false });
+    const page = await browser.newPage();
+    await Promise.all([
+    await page.goto('https://www.croxyproxy.com/'),
+    await page.waitForNetworkIdle() // Tunggu jaringan stabil
+    ]);
+    // Ketik URL dan kirimkan form
+    await page.type('#url', 'https://otakudesu.cloud');
+    await Promise.all([
+        page.click('#requestSubmit'), // Klik tombol kirim
+        page.waitForNavigation({ waitUntil: 'networkidle2' }), // Tunggu navigasi selesai
+        // page.waitForFrame('#__cpsHeader')
+    ]);
+    // Tunggu sampai elemen dengan judul "Proxy is launching..." hilang
+    // await page.waitForFunction(
+    //     () => !document.querySelector('title')?.innerText.includes('Proxy is launching...')
+    // );
+    // Tunggu sampai semua elemen gambar telah berhasil terload
+    await page.waitForSelector('img', { visible: true, timeout: 60000 });
+    await page.evaluate(() => {
+        const images = Array.from(document.images);
+        return Promise.all(images.map(img => {
+            if (img.complete) return Promise.resolve();
+            return new Promise(resolve => {
+                img.onload = img.onerror = resolve;
+            });
+        }));
+    });
+    // Ambil screenshot
+    await page.screenshot({ path: 'screenshot.png' });
+
+    // Ambil konten halaman
+    const html = await page.content();
+    console.log(html);
+
+    // Tutup browser
+    await browser.close();
 })();
