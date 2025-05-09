@@ -2,7 +2,6 @@ import puppeteer, { Browser, Page, ElementHandle } from "puppeteer";
 import fs from 'fs/promises'; // For saving to JSON
 
 // Helper function to parse Local Guide info string (to be used inside page.evaluate)
-// This string will be eval'd inside page.evaluate
 const parseLocalGuideInfoScript = `
   function parseLocalGuideInfo(infoString) {
     if (!infoString || typeof infoString !== 'string') return { isLocalGuide: false, reviewerReviewCount: null, reviewerPhotoCount: null };
@@ -11,8 +10,8 @@ const parseLocalGuideInfoScript = `
     const photoMatch = infoString.match(/(\\d+)\\s+photos/);
     return {
       isLocalGuide,
-      reviewerReviewCount: reviewMatch ? parseInt(reviewMatch[1], 10) : null,
-      reviewerPhotoCount: photoMatch ? parseInt(photoMatch[1], 10) : null,
+      reviewerReviewCount: (reviewMatch && reviewMatch[1]) ? parseInt(reviewMatch[1], 10) : null,
+      reviewerPhotoCount: (photoMatch && photoMatch[1]) ? parseInt(photoMatch[1], 10) : null,
     };
   }
 `;
@@ -40,6 +39,7 @@ interface ReviewSummary {
   ratingBreakdown: { stars: number; count: number }[];
 }
 
+const BATCH_SAVE_SIZE = 10; // Save every 10 new reviews
 
 (async () => {
   console.log(`Running with Node.js version: ${process.version}`);
@@ -55,8 +55,10 @@ interface ReviewSummary {
   let browser: Browser | null = null;
   let page: Page | null = null;
   const allExtractedReviews: ReviewData[] = [];
+  let reviewsInCurrentBatch = 0; // Counter for batch saving
 
   const SCROLLABLE_REVIEWS_PANEL_SELECTOR = 'div.m6QErb.DxyBCb.kA9KIf.dS8AEf.XiKgde[tabindex="-1"]';
+  const OUTPUT_FILE_PATH = 'reviews_output.json';
 
   try {
     console.log("🚀 Launching browser...");
@@ -109,12 +111,10 @@ interface ReviewSummary {
           totalReviews: 0,
           ratingBreakdown: [],
         };
-
         const averageRatingEl = document.querySelector('div.PPCwl div.jANrlb div.fontDisplayLarge');
         if (averageRatingEl?.textContent) {
           summary.averageRating = parseFloat(averageRatingEl.textContent.trim());
         }
-
         let calculatedTotalFromBreakdown = 0;
         const ratingRows = Array.from(document.querySelectorAll('div.ExlQHd table tr.BHOKXe'));
         const ratingRegex = /(\d+)\s*stars,\s*([\d,]+)\s*reviews/i;
@@ -130,7 +130,6 @@ interface ReviewSummary {
             }
           }
         }
-
         const totalReviewsTextEl = document.querySelector('div.PPCwl div.jANrlb div.fontBodySmall');
         if (totalReviewsTextEl?.textContent) {
           const totalMatch = totalReviewsTextEl.textContent.match(/([\d.,]+)\s*reviews/i);
@@ -138,7 +137,6 @@ interface ReviewSummary {
             summary.totalReviews = parseInt(totalMatch[1].replace(/[.,]/g, ''), 10);
           }
         }
-
         if (summary.totalReviews === 0 && calculatedTotalFromBreakdown > 0) {
           summary.totalReviews = calculatedTotalFromBreakdown;
         } else if (summary.totalReviews === 0 && summary.ratingBreakdown.length === 0 && summary.averageRating === null) {
@@ -152,13 +150,13 @@ interface ReviewSummary {
         console.log(JSON.stringify(reviewSummaryData, null, 2));
         const breakdownSum = reviewSummaryData.ratingBreakdown.reduce((sum, item) => sum + item.count, 0);
         if (reviewSummaryData.totalReviews > 0 && breakdownSum > 0 && reviewSummaryData.totalReviews !== breakdownSum) {
-            console.warn(`⚠️ Mismatch in total reviews: text says ${reviewSummaryData.totalReviews}, breakdown sum is ${breakdownSum}. Using text value if available, otherwise breakdown.`);
+            console.warn(`⚠️ Mismatch in total reviews: text says ${reviewSummaryData.totalReviews}, breakdown sum is ${breakdownSum}.`);
         }
       } else {
-        console.warn("⚠️ Review summary elements found, but no data extracted or all fields were null. HTML structure might have changed.");
+        console.warn("⚠️ Review summary elements found, but no data extracted or all fields were null.");
       }
     } catch (summaryError) {
-      console.warn("⚠️ Could not extract review rating summary. Elements might not be present.", summaryError instanceof Error ? summaryError.message : summaryError);
+      console.warn("⚠️ Could not extract review rating summary.", summaryError instanceof Error ? summaryError.message : summaryError);
     }
 
     const sortSelectors = [
@@ -204,64 +202,53 @@ interface ReviewSummary {
           .catch(() => console.warn("⚠️ Initial individual reviews (.jftiEf) not found."));
     }
 
-    console.log("📜 Starting to scroll and extract all reviews...");
+    console.log(`📜 Starting to scroll and extract all reviews (saving every ${BATCH_SAVE_SIZE} new reviews)...`);
     const reviewSelector = "div.jftiEf.fontBodyMedium";
     let noNewReviewsCount = 0;
     const maxConsecutiveNoNewReviews = 3;
-    const processedReviewIds = new Set<string>(); // Correctly typed for string IDs
+    const processedReviewIds = new Set<string>();
     let scrollAttempts = 0;
     const maxScrollAttempts = 100;
 
-    await page.evaluate(parseLocalGuideInfoScript); // Make parseLocalGuideInfo globally available on page
+    await page.evaluate(parseLocalGuideInfoScript);
 
     while (scrollAttempts < maxScrollAttempts) {
       scrollAttempts++;
-      // Removed unused currentReviewCount
 
       const newReviewsOnPage = await page.evaluate((reviewSel, helperScriptString) => {
-        // eslint-disable-next-line no-eval
-        if (typeof (window as any).parseLocalGuideInfo !== 'function') { // Ensure helper is available
+        if (typeof (window as any).parseLocalGuideInfo !== 'function') {
+            // eslint-disable-next-line no-eval
             eval(helperScriptString);
         }
-
         const reviewElements = Array.from(document.querySelectorAll(reviewSel));
         const extractedData: ReviewData[] = [];
-
         for (const el of reviewElements) {
           const reviewId = el.getAttribute('data-review-id');
-          // if (!reviewId) continue; // Skip if no ID - handled later by checking typeof review.reviewId
-
           const reviewerName = el.querySelector('.d4r55')?.textContent?.trim() || null;
           const reviewerAvatarUrl = (el.querySelector('button.WEBjve img.NBa7we') as HTMLImageElement | null)?.src || null;
           const reviewerProfileUrl = (el.querySelector('button.WEBjve')?.getAttribute('data-href') || el.querySelector('button.al6Kxe')?.getAttribute('data-href')) || null;
-          
           const ratingText = el.querySelector('.DU9Pgb span.fzvQIb')?.textContent?.trim() || null;
           let rating: number | null = null;
           if (ratingText) {
             const match = ratingText.match(/(\d+(\.\d+)?)/);
             if (match && match[1]) rating = parseFloat(match[1]);
           }
-
           const dateEl = el.querySelector('.DU9Pgb span.xRkPPb');
           let relativeDate: string | null = null;
           let reviewSource: string | null = 'Unknown';
-
           if (dateEl) {
             const sourceImgEl = dateEl.querySelector('span.qmhsmd img.ARRgmb') as HTMLImageElement | null;
             const sourceTextContainer = dateEl.querySelector('span.qmhsmd');
-
-            if (sourceImgEl?.alt) { // FIX for Error 2 & 3
+            if (sourceImgEl?.alt) {
                 reviewSource = sourceImgEl.alt.trim();
             } else if (sourceTextContainer?.textContent) {
                 reviewSource = sourceTextContainer.textContent.trim();
             }
-            
             let fullDateText = dateEl.textContent || '';
             if (sourceTextContainer?.textContent) {
                 fullDateText = fullDateText.replace(sourceTextContainer.textContent, '').trim();
             }
             relativeDate = fullDateText.replace(/\s*on\s*$/i, '').trim();
-
             if ((reviewSource === 'Unknown' || !reviewSource) && relativeDate && relativeDate.toLowerCase().includes(' on ')) {
                 const parts = relativeDate.split(/\s+on\s+/i);
                 if (parts.length > 1) {
@@ -270,48 +257,43 @@ interface ReviewSummary {
                 }
             }
           }
-          
           const reviewTextContentEl = el.querySelector('div.MyEned span.wiI7pd');
           const reviewText = reviewTextContentEl?.textContent?.trim() || null;
           const isTruncated = !!el.querySelector('div.MyEned button.w8nwRe, div.MyEned button.OV4Zld');
-
           const localGuideTextContent = el.querySelector('div.RfnDt')?.textContent?.trim();
-          // FIX for Error 4: Access parseLocalGuideInfo via window and provide a default
           const lgInfo = (window as any).parseLocalGuideInfo ? 
                          (window as any).parseLocalGuideInfo(localGuideTextContent) : 
                          { isLocalGuide: false, reviewerReviewCount: null, reviewerPhotoCount: null };
-          
           extractedData.push({
-            reviewId,
-            reviewerName,
-            reviewerAvatarUrl,
-            reviewerProfileUrl,
-            rating,
-            ratingText,
-            relativeDate,
-            reviewSource: reviewSource || 'Unknown',
-            reviewText,
-            isTruncated,
-            isLocalGuide: lgInfo.isLocalGuide,
-            reviewerReviewCount: lgInfo.reviewerReviewCount,
-            reviewerPhotoCount: lgInfo.reviewerPhotoCount,
-            isNew: !!el.querySelector('.DU9Pgb div.W8gobe'),
+            reviewId, reviewerName, reviewerAvatarUrl, reviewerProfileUrl, rating, ratingText,
+            relativeDate, reviewSource: reviewSource || 'Unknown', reviewText, isTruncated,
+            isLocalGuide: lgInfo.isLocalGuide, reviewerReviewCount: lgInfo.reviewerReviewCount,
+            reviewerPhotoCount: lgInfo.reviewerPhotoCount, isNew: !!el.querySelector('.DU9Pgb div.W8gobe'),
           });
         }
         return extractedData;
-      }, reviewSelector, parseLocalGuideInfoScript); // Pass script string for eval
+      }, reviewSelector, parseLocalGuideInfoScript);
       
       let actuallyAddedCount = 0;
       for (const review of newReviewsOnPage) {
-        // FIX for Error 1: Ensure review.reviewId is a string before using with Set<string>
         if (typeof review.reviewId === 'string' && !processedReviewIds.has(review.reviewId)) {
           allExtractedReviews.push(review);
-          processedReviewIds.add(review.reviewId); // review.reviewId is definitely string here
+          processedReviewIds.add(review.reviewId);
           actuallyAddedCount++;
+          reviewsInCurrentBatch++; // Increment for batch saving
         }
       }
 
-      console.log(`📜 Scroll attempt ${scrollAttempts}: Found ${newReviewsOnPage.length} reviews on page, ${actuallyAddedCount} new unique reviews added. Total: ${processedReviewIds.size}`);
+      console.log(`📜 Scroll attempt ${scrollAttempts}: Found ${newReviewsOnPage.length} on page, ${actuallyAddedCount} new. Total: ${processedReviewIds.size}. In batch: ${reviewsInCurrentBatch}`);
+
+      // ***** BATCH SAVE LOGIC *****
+      if (reviewsInCurrentBatch >= BATCH_SAVE_SIZE) {
+        if (allExtractedReviews.length > 0) {
+          await fs.writeFile(OUTPUT_FILE_PATH, JSON.stringify(allExtractedReviews, null, 2));
+          console.log(`💾 Batch save: ${allExtractedReviews.length} total reviews saved to ${OUTPUT_FILE_PATH}. Last batch size: ${reviewsInCurrentBatch}`);
+          reviewsInCurrentBatch = 0; // Reset batch counter
+        }
+      }
 
       if (actuallyAddedCount === 0) {
         noNewReviewsCount++;
@@ -335,7 +317,6 @@ interface ReviewSummary {
       }
 
       try {
-        // FIX for Error 5: Replace waitForTimeout
         await new Promise(r => setTimeout(r, 2000 + Math.random() * 1000));
       } catch (e) {
         console.warn("Timeout during scroll wait, continuing.", e);
@@ -344,15 +325,19 @@ interface ReviewSummary {
     if (scrollAttempts >= maxScrollAttempts) {
         console.warn("⚠️ Reached max scroll attempts.");
     }
-    console.log(`✅ Finished scrolling. Extracted ${allExtractedReviews.length} unique reviews.`);
+    
+    console.log(`✅ Finished scrolling. Extracted ${allExtractedReviews.length} unique reviews in total.`);
 
-    if (allExtractedReviews.length > 0) {
-      const filePath = 'reviews_output.json';
-      await fs.writeFile(filePath, JSON.stringify(allExtractedReviews, null, 2));
-      console.log(`💾 All reviews saved to ${filePath}`);
-    } else {
+    // ***** FINAL SAVE (for any remaining reviews not part of a full batch) *****
+    if (allExtractedReviews.length > 0 && reviewsInCurrentBatch > 0) { // Only save if there are unsaved items
+      await fs.writeFile(OUTPUT_FILE_PATH, JSON.stringify(allExtractedReviews, null, 2));
+      console.log(`💾 Final save: ${allExtractedReviews.length} total reviews saved to ${OUTPUT_FILE_PATH}. Unsaved from last batch: ${reviewsInCurrentBatch}`);
+    } else if (allExtractedReviews.length > 0 && reviewsInCurrentBatch === 0) {
+        console.log(`💾 All reviews already saved in batches. Final count: ${allExtractedReviews.length}.`);
+    } else if (allExtractedReviews.length === 0) {
       console.log("💾 No reviews extracted to save.");
     }
+
 
     console.log("🎉 Script completed successfully.");
 
