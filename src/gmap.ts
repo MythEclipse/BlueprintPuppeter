@@ -1,272 +1,380 @@
 import puppeteer, { Browser, Page, ElementHandle } from "puppeteer";
+import fs from 'fs/promises'; // For saving to JSON
+
+// Helper function to parse Local Guide info string (to be used inside page.evaluate)
+// This string will be eval'd inside page.evaluate
+const parseLocalGuideInfoScript = `
+  function parseLocalGuideInfo(infoString) {
+    if (!infoString || typeof infoString !== 'string') return { isLocalGuide: false, reviewerReviewCount: null, reviewerPhotoCount: null };
+    const isLocalGuide = infoString.includes('Local Guide');
+    const reviewMatch = infoString.match(/(\\d+)\\s+reviews/);
+    const photoMatch = infoString.match(/(\\d+)\\s+photos/);
+    return {
+      isLocalGuide,
+      reviewerReviewCount: reviewMatch ? parseInt(reviewMatch[1], 10) : null,
+      reviewerPhotoCount: photoMatch ? parseInt(photoMatch[1], 10) : null,
+    };
+  }
+`;
+
+interface ReviewData {
+  reviewId: string | null;
+  reviewerName: string | null;
+  reviewerAvatarUrl: string | null;
+  reviewerProfileUrl: string | null;
+  rating: number | null;
+  ratingText: string | null;
+  relativeDate: string | null;
+  reviewSource: string | null;
+  reviewText: string | null;
+  isTruncated: boolean;
+  isLocalGuide: boolean;
+  reviewerReviewCount: number | null;
+  reviewerPhotoCount: number | null;
+  isNew: boolean;
+}
+
+interface ReviewSummary {
+  averageRating: number | null;
+  totalReviews: number;
+  ratingBreakdown: { stars: number; count: number }[];
+}
+
 
 (async () => {
   console.log(`Running with Node.js version: ${process.version}`);
-
-  if (
-    !process.version.startsWith("v20.") &&
-    !process.version.startsWith("v18.") &&
-    !process.version.startsWith("v22.")
-  ) {
-    console.warn(
-      "Warning: You are not using a Node.js LTS version. This might cause issues with Puppeteer. Recommended: v18.x, v20.x, or v22.x LTS."
-    );
+  if (!/^v(18|20|22)\./.test(process.version)) {
+    console.warn("⚠️ Recommended Node.js version is v18.x, v20.x, or v22.x LTS.");
   }
 
   const launchConfig = {
-    headless: false, // Set to true for production/CI
-    args: [
-      "--disable-infobars",
-      "--window-size=1366,768", // Set window size early
-      "--lang=en-US,en", // Force English
-    ],
+    headless: false, // Set to true for CI/production
+    args: ["--disable-infobars", "--window-size=1366,768", "--lang=en-US,en"],
   };
 
-  console.log("Launching browser...");
-  const browser: Browser = await puppeteer.launch(launchConfig);
-  const page: Page = await browser.newPage();
-  console.log("Browser launched.");
+  let browser: Browser | null = null;
+  let page: Page | null = null;
+  const allExtractedReviews: ReviewData[] = [];
 
-  await page.setExtraHTTPHeaders({
-    "Accept-Language": "en-US,en;q=0.9", // Reinforce English preference
-  });
-
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36"
-  );
-  await page.setViewport({ width: 1366, height: 768 });
+  const SCROLLABLE_REVIEWS_PANEL_SELECTOR = 'div.m6QErb.DxyBCb.kA9KIf.dS8AEf.XiKgde[tabindex="-1"]';
 
   try {
-    const mapUrl =
-      "https://www.google.com/maps/place/InterContinental+Bali+Resort/@-8.7796436,115.1651043,1453m/data=!3m1!1e3!4m12!3m11!1s0x2dd2448c90392e65:0xfe84ecc9e6b29627!5m3!1s2025-05-26!4m1!1i2!8m2!3d-8.7796489!4d115.1676792!9m1!1b1!16s%2Fm%2F0c40xfm?entry=ttu&hl=en";
-    console.log(`Navigating to: ${mapUrl}`);
-    await page.goto(mapUrl, {
-      waitUntil: "networkidle0",
-      timeout: 120 * 1000,
-    }); // 2 minutes
-    console.log("Page loaded.");
+    console.log("🚀 Launching browser...");
+    browser = await puppeteer.launch(launchConfig);
+    page = await browser.newPage();
 
-    // Handle cookie consent (if it appears)
-    // You mentioned "tidak ada cookie consent", so this might be skipped.
-    // The current logic handles this well by trying selectors and moving on if none are found.
-    try {
-      const consentButtonSelectors = [
-        'button[aria-label="Accept all"]',
-        'button[aria-label="Reject all"]',
-        'form[action*="consent.google.com"] button', // General form button
-        'div[role="dialog"] button:is([aria-label*="Accept"], [aria-label*="Agree"])', // Dialog specific
-        'div[role="dialog"] button', // Any button in a dialog as a last resort
-      ];
-
-      let consentClicked = false;
-      console.log("Checking for cookie consent dialog...");
-      for (const selector of consentButtonSelectors) {
-        try {
-          const button = await page.waitForSelector(selector, {
-            timeout: 1000, // Shorter timeout for each individual selector try
-            visible: true,
-          });
-          if (button) {
-            console.log(
-              `Attempting to click consent button with selector: ${selector}`
-            );
-            await button.click();
-            console.log("Clicked consent button.");
-            consentClicked = true;
-            // Wait for potential navigation or page update after consent
-            await page
-              .waitForNavigation({ waitUntil: "networkidle0", timeout: 15000 })
-              .catch(() => {
-                console.log(
-                  "No navigation after consent click, or it timed out. Continuing."
-                );
-              });
-            await button.dispose();
-            break; // Exit loop once a button is clicked
-          }
-        } catch (e) {
-          // console.log(`Consent selector "${selector}" not found or timed out.`);
-        }
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+      if (request.resourceType() === 'image' && !request.url().includes('gstatic.com/images/branding') && !request.url().includes('gstatic.com/travel-hotels/branding')) {
+        request.abort();
+      } else {
+        request.continue();
       }
-      if (!consentClicked) {
-        console.log(
-          "No applicable cookie consent button found or clicked (possibly already accepted/not present, or using a new selector)."
-        );
-      }
-    } catch (e) {
-      console.warn(
-        "Cookie consent handling encountered an issue or was skipped:",
-        (e as Error).message
-      );
-    }
+    });
+    console.log("🖼️ Image request interception (selective) enabled.");
 
-    // Wait a bit for the page to fully render reviews section if necessary
-    // This might be needed if the reviews load asynchronously after the main page load
-    // console.log("Waiting a few seconds for dynamic content to potentially load...");
-    // await page.waitForTimeout(3000); // Use sparingly, prefer explicit waits
+    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36");
+    await page.setViewport({ width: 1366, height: 768 });
 
-    // Find the sort button (initial state: "Most relevant")
-    // Based on your HTML: 'button[aria-label="Most relevant"]' is the primary target
-    const sortButtonSelectors = [
-      'button[aria-label="Most relevant"]', // Primary target from your HTML
-      'button[aria-label="Sort reviews"]',
-      'button[aria-label*="Sort by"]',
-      'button[data-value*="Sort"]',
-      'button[jsaction*="sortReviews"]',
-      'button[jsaction*="sort"]',
-      // A more generic one if specific labels change
-      'button[id*="sort-"], button[data-value*="Sort"]',
+    const mapUrl = "https://www.google.com/maps/place/InterContinental+Bali+Resort/@-8.7796436,115.1651043,1453m/data=!3m1!1e3!4m12!3m11!1s0x2dd2448c90392e65:0xfe84ecc9e6b29627!5m3!1s2025-05-26!4m1!1i2!8m2!3d-8.7796489!4d115.1676792!9m1!1b1!16s%2Fm%2F0c40xfm?entry=ttu&hl=en";
+    console.log(`🌍 Navigating to: ${mapUrl}`);
+    await page.goto(mapUrl, { waitUntil: "networkidle0", timeout: 120000 });
+    console.log("✅ Page loaded.");
+
+    const consentSelectors = [
+      'button[aria-label="Accept all"]', 'button[aria-label="Reject all"]',
+      'form[action*="consent.google.com"] button',
+      'div[role="dialog"] button:is([aria-label*="Accept"], [aria-label*="Agree"])',
+      'div[role="dialog"] button',
     ];
-
-    let sortButton: ElementHandle<Element> | null = null;
-    console.log("Attempting to find the sort button (e.g., 'Most relevant')...");
-    for (const selector of sortButtonSelectors) {
+    for (const selector of consentSelectors) {
       try {
-        // It's good practice to ensure the element is not only present but also visible and interactable.
-        // Sometimes an element can be in the DOM but obscured or disabled.
-        // For this button, being visible should be enough.
-        sortButton = await page.waitForSelector(selector, {
-          timeout: 10000, // Max 10s for each selector
-          visible: true,
-        });
-        if (sortButton) {
-          console.log(`Sort button found with selector: ${selector}`);
+        const button = await page.waitForSelector(selector, { timeout: 1000, visible: true });
+        if (button) {
+          await button.click();
+          console.log(`✅ Clicked cookie consent: ${selector}`);
+          await page.waitForNavigation({ waitUntil: "networkidle0", timeout: 15000 }).catch(() => {});
           break;
         }
-      } catch (err) {
-        // console.log(`Sort button selector "${selector}" not found.`);
+      } catch {}
+    }
+
+    console.log("📊 Attempting to extract review rating summary...");
+    try {
+      await page.waitForSelector('div.ExlQHd table tr.BHOKXe, div.jANrlb div.fontDisplayLarge', { visible: true, timeout: 15000 });
+      const reviewSummaryData: ReviewSummary | null = await page.evaluate(() => {
+        const summary: ReviewSummary = {
+          averageRating: null,
+          totalReviews: 0,
+          ratingBreakdown: [],
+        };
+
+        const averageRatingEl = document.querySelector('div.PPCwl div.jANrlb div.fontDisplayLarge');
+        if (averageRatingEl?.textContent) {
+          summary.averageRating = parseFloat(averageRatingEl.textContent.trim());
+        }
+
+        let calculatedTotalFromBreakdown = 0;
+        const ratingRows = Array.from(document.querySelectorAll('div.ExlQHd table tr.BHOKXe'));
+        const ratingRegex = /(\d+)\s*stars,\s*([\d,]+)\s*reviews/i;
+        for (const row of ratingRows) {
+          const ariaLabel = row.getAttribute('aria-label');
+          if (ariaLabel) {
+            const match = ariaLabel.match(ratingRegex);
+            if (match?.[1] && match?.[2]) {
+              const stars = parseInt(match[1], 10);
+              const count = parseInt(match[2].replace(/,/g, ''), 10);
+              summary.ratingBreakdown.push({ stars, count });
+              calculatedTotalFromBreakdown += count;
+            }
+          }
+        }
+
+        const totalReviewsTextEl = document.querySelector('div.PPCwl div.jANrlb div.fontBodySmall');
+        if (totalReviewsTextEl?.textContent) {
+          const totalMatch = totalReviewsTextEl.textContent.match(/([\d.,]+)\s*reviews/i);
+          if (totalMatch?.[1]) {
+            summary.totalReviews = parseInt(totalMatch[1].replace(/[.,]/g, ''), 10);
+          }
+        }
+
+        if (summary.totalReviews === 0 && calculatedTotalFromBreakdown > 0) {
+          summary.totalReviews = calculatedTotalFromBreakdown;
+        } else if (summary.totalReviews === 0 && summary.ratingBreakdown.length === 0 && summary.averageRating === null) {
+            return null; 
+        }
+        return summary;
+      });
+
+      if (reviewSummaryData) {
+        console.log("📊 Review Summary Extracted:");
+        console.log(JSON.stringify(reviewSummaryData, null, 2));
+        const breakdownSum = reviewSummaryData.ratingBreakdown.reduce((sum, item) => sum + item.count, 0);
+        if (reviewSummaryData.totalReviews > 0 && breakdownSum > 0 && reviewSummaryData.totalReviews !== breakdownSum) {
+            console.warn(`⚠️ Mismatch in total reviews: text says ${reviewSummaryData.totalReviews}, breakdown sum is ${breakdownSum}. Using text value if available, otherwise breakdown.`);
+        }
+      } else {
+        console.warn("⚠️ Review summary elements found, but no data extracted or all fields were null. HTML structure might have changed.");
       }
+    } catch (summaryError) {
+      console.warn("⚠️ Could not extract review rating summary. Elements might not be present.", summaryError instanceof Error ? summaryError.message : summaryError);
+    }
+
+    const sortSelectors = [
+      'button[aria-label="Most relevant"]', 'button[aria-label="Sort reviews"]',
+      'button[aria-label*="Sort by"]', 'button[jsaction*="sortReviews"]',
+    ];
+    let sortButton: ElementHandle<Element> | null = null;
+    for (const selector of sortSelectors) {
+      try {
+        sortButton = await page.waitForSelector(selector, { timeout: 5000, visible: true });
+        if (sortButton) {
+          console.log(`✅ Found sort button: ${selector}`);
+          break;
+        }
+      } catch {}
     }
 
     if (sortButton) {
-      console.log("Sort button found. Clicking to open sort options...");
       await sortButton.click();
-      // No need to dispose here yet if we need to check its state later,
-      // but since we're done with this specific handle for clicking, it's fine.
       await sortButton.dispose();
-
-      // Wait for the dropdown menu items to appear
-      // Based on your HTML: 'div[role="menuitemradio"]' is the container for options
       const menuItemSelector = 'div[role="menuitemradio"]';
-      try {
-        await page.waitForSelector(menuItemSelector, {
-          visible: true,
-          timeout: 10000,
-        });
-        console.log("Sort options dropdown menu items are now visible.");
-      } catch (e) {
-        console.error(
-          "Sort options dropdown menu items did not become visible in time."
-        );
-        throw e; // Re-throw to be caught by the main try-catch
-      }
-
-      const newestOptionText = "Newest";
-      console.log(`Attempting to find and click the '${newestOptionText}' option...`);
-
-      // Using page.evaluateHandle to find the element by text content.
-      // This is robust as class names can change.
+      await page.waitForSelector(menuItemSelector, { visible: true, timeout: 10000 });
       const newestOptionHandle = await page.evaluateHandle(
-        (text, itemSelector) => {
-          const menuItems = document.querySelectorAll(itemSelector);
-          for (const item of Array.from(menuItems)) {
-            // Check text content, including children, and trim whitespace
-            if (item.textContent?.trim() === text) {
-              return item; // Return the DOM element
-            }
-          }
-          return null; // Return null if not found
-        },
-        newestOptionText,
-        menuItemSelector
+        (text, selector) => Array.from(document.querySelectorAll(selector)).find(el => el.textContent?.trim() === text) || null,
+        "Newest", menuItemSelector
       );
-
-      const newestElement = newestOptionHandle
-        ? await newestOptionHandle.asElement()
-        : null;
-
-      if (newestElement) {
-        console.log(`Found '${newestOptionText}' option. Clicking...`);
-        // Before clicking, ensure it's clickable (e.g., not disabled, visible)
-        // await newestElement.waitForSelector('&:not([disabled])', { visible: true }); // More advanced check
-        await (newestElement as ElementHandle<HTMLElement>).click(); // Cast to HTMLElement for click
-        console.log(
-          `Clicked on '${newestOptionText}'. Waiting for reviews to update...`
-        );
-
-        // Wait for some indication that the reviews have re-sorted.
-        // This could be waiting for a spinner to disappear, or for a known element
-        // in the first review to change or appear.
-        // The selector '.jftiEf' is for review items. Waiting for it to be present
-        // might not be enough if it was already present.
-        // A more robust way would be to:
-        // 1. Get the text of the first review *before* sorting.
-        // 2. Wait for the text of the first review to *change* after sorting.
-        // For simplicity, we'll use your existing wait, assuming new content loads.
-        // It's better to wait for a specific change or a loading indicator to disappear.
+      const newestOption = newestOptionHandle.asElement();
+      if (newestOption) {
+        await (newestOption as ElementHandle<Element>).click();
+        console.log("🔄 Sorted by 'Newest'. Waiting for reviews to refresh...");
         try {
-          // Example: Wait for a network idle state after click, indicating data has loaded
-          await page.waitForNetworkIdle({ timeout: 20000, idleTime: 500 });
-          console.log("Network is idle, reviews likely updated.");
-        } catch(networkIdleError) {
-            console.warn("Network did not become idle after sorting, might still be loading or sort failed to trigger significant network activity. Will proceed with selector wait.");
-        }
-        
-        // Then, ensure the review list is still visible/re-rendered.
-        const reviewContentSelector = ".jftiEf"; // A class often associated with review entries
-        try {
-            await page.waitForSelector(reviewContentSelector, { visible: true, timeout: 30000 });
-            console.log("Review content area is visible after sorting by Newest.");
-        } catch (reviewWaitError) {
-            console.warn(`Could not find selector '${reviewContentSelector}' after sorting. Review list might not have updated as expected.`);
-            await page.screenshot({ path: `debug_reviews_not_updated_${Date.now()}.png` });
-        }
-
-        await newestElement.dispose();
+          await page.waitForNetworkIdle({ idleTime: 1000, timeout: 20000 });
+        } catch (e){ console.warn("⚠️ Network idle timeout after sorting, proceeding."); }
+        await page.waitForSelector(".jftiEf", { visible: true, timeout: 30000 }).catch(() => console.warn("Individual reviews (.jftiEf) not found after sort."));
+        console.log("✅ Reviews list potentially updated after sort.");
       } else {
-        console.warn(
-          `Couldn't find '${newestOptionText}' option in dropdown.`
-        );
-        await page.screenshot({
-          path: `debug_newest_option_not_found_${Date.now()}.png`,
-        });
+        console.warn("⚠️ Could not find 'Newest' option.");
       }
-      await newestOptionHandle.dispose(); // Dispose handle in either case
+      if (newestOptionHandle) await newestOptionHandle.dispose();
     } else {
-      console.warn(
-        "Sort button (e.g., 'Most relevant') not found after trying all selectors."
-      );
-      await page.screenshot({
-        path: `debug_sort_button_not_found_${Date.now()}.png`,
-      });
+      console.warn("⚠️ Sort button not found. Proceeding with default sort.");
+      await page.waitForSelector(".jftiEf", { visible: true, timeout: 30000 })
+          .catch(() => console.warn("⚠️ Initial individual reviews (.jftiEf) not found."));
     }
 
-    console.log("Script operations completed successfully.");
+    console.log("📜 Starting to scroll and extract all reviews...");
+    const reviewSelector = "div.jftiEf.fontBodyMedium";
+    let noNewReviewsCount = 0;
+    const maxConsecutiveNoNewReviews = 3;
+    const processedReviewIds = new Set<string>(); // Correctly typed for string IDs
+    let scrollAttempts = 0;
+    const maxScrollAttempts = 100;
 
-  } catch (error) {
-    console.error("An error occurred in the main script:", error);
-    if (page && !page.isClosed()) {
-      const errorScreenshotPath = `debug_error_state_${Date.now()}.png`;
+    await page.evaluate(parseLocalGuideInfoScript); // Make parseLocalGuideInfo globally available on page
+
+    while (scrollAttempts < maxScrollAttempts) {
+      scrollAttempts++;
+      // Removed unused currentReviewCount
+
+      const newReviewsOnPage = await page.evaluate((reviewSel, helperScriptString) => {
+        // eslint-disable-next-line no-eval
+        if (typeof (window as any).parseLocalGuideInfo !== 'function') { // Ensure helper is available
+            eval(helperScriptString);
+        }
+
+        const reviewElements = Array.from(document.querySelectorAll(reviewSel));
+        const extractedData: ReviewData[] = [];
+
+        for (const el of reviewElements) {
+          const reviewId = el.getAttribute('data-review-id');
+          // if (!reviewId) continue; // Skip if no ID - handled later by checking typeof review.reviewId
+
+          const reviewerName = el.querySelector('.d4r55')?.textContent?.trim() || null;
+          const reviewerAvatarUrl = (el.querySelector('button.WEBjve img.NBa7we') as HTMLImageElement | null)?.src || null;
+          const reviewerProfileUrl = (el.querySelector('button.WEBjve')?.getAttribute('data-href') || el.querySelector('button.al6Kxe')?.getAttribute('data-href')) || null;
+          
+          const ratingText = el.querySelector('.DU9Pgb span.fzvQIb')?.textContent?.trim() || null;
+          let rating: number | null = null;
+          if (ratingText) {
+            const match = ratingText.match(/(\d+(\.\d+)?)/);
+            if (match && match[1]) rating = parseFloat(match[1]);
+          }
+
+          const dateEl = el.querySelector('.DU9Pgb span.xRkPPb');
+          let relativeDate: string | null = null;
+          let reviewSource: string | null = 'Unknown';
+
+          if (dateEl) {
+            const sourceImgEl = dateEl.querySelector('span.qmhsmd img.ARRgmb') as HTMLImageElement | null;
+            const sourceTextContainer = dateEl.querySelector('span.qmhsmd');
+
+            if (sourceImgEl?.alt) { // FIX for Error 2 & 3
+                reviewSource = sourceImgEl.alt.trim();
+            } else if (sourceTextContainer?.textContent) {
+                reviewSource = sourceTextContainer.textContent.trim();
+            }
+            
+            let fullDateText = dateEl.textContent || '';
+            if (sourceTextContainer?.textContent) {
+                fullDateText = fullDateText.replace(sourceTextContainer.textContent, '').trim();
+            }
+            relativeDate = fullDateText.replace(/\s*on\s*$/i, '').trim();
+
+            if ((reviewSource === 'Unknown' || !reviewSource) && relativeDate && relativeDate.toLowerCase().includes(' on ')) {
+                const parts = relativeDate.split(/\s+on\s+/i);
+                if (parts.length > 1) {
+                    relativeDate = parts[0] ? parts[0].trim() : null;
+                    reviewSource = parts.slice(1).join(' on ').trim();
+                }
+            }
+          }
+          
+          const reviewTextContentEl = el.querySelector('div.MyEned span.wiI7pd');
+          const reviewText = reviewTextContentEl?.textContent?.trim() || null;
+          const isTruncated = !!el.querySelector('div.MyEned button.w8nwRe, div.MyEned button.OV4Zld');
+
+          const localGuideTextContent = el.querySelector('div.RfnDt')?.textContent?.trim();
+          // FIX for Error 4: Access parseLocalGuideInfo via window and provide a default
+          const lgInfo = (window as any).parseLocalGuideInfo ? 
+                         (window as any).parseLocalGuideInfo(localGuideTextContent) : 
+                         { isLocalGuide: false, reviewerReviewCount: null, reviewerPhotoCount: null };
+          
+          extractedData.push({
+            reviewId,
+            reviewerName,
+            reviewerAvatarUrl,
+            reviewerProfileUrl,
+            rating,
+            ratingText,
+            relativeDate,
+            reviewSource: reviewSource || 'Unknown',
+            reviewText,
+            isTruncated,
+            isLocalGuide: lgInfo.isLocalGuide,
+            reviewerReviewCount: lgInfo.reviewerReviewCount,
+            reviewerPhotoCount: lgInfo.reviewerPhotoCount,
+            isNew: !!el.querySelector('.DU9Pgb div.W8gobe'),
+          });
+        }
+        return extractedData;
+      }, reviewSelector, parseLocalGuideInfoScript); // Pass script string for eval
+      
+      let actuallyAddedCount = 0;
+      for (const review of newReviewsOnPage) {
+        // FIX for Error 1: Ensure review.reviewId is a string before using with Set<string>
+        if (typeof review.reviewId === 'string' && !processedReviewIds.has(review.reviewId)) {
+          allExtractedReviews.push(review);
+          processedReviewIds.add(review.reviewId); // review.reviewId is definitely string here
+          actuallyAddedCount++;
+        }
+      }
+
+      console.log(`📜 Scroll attempt ${scrollAttempts}: Found ${newReviewsOnPage.length} reviews on page, ${actuallyAddedCount} new unique reviews added. Total: ${processedReviewIds.size}`);
+
+      if (actuallyAddedCount === 0) {
+        noNewReviewsCount++;
+        if (noNewReviewsCount >= maxConsecutiveNoNewReviews) {
+          console.log(`🚫 No new reviews after ${maxConsecutiveNoNewReviews} scrolls. Assuming end of list.`);
+          break;
+        }
+      } else {
+        noNewReviewsCount = 0;
+      }
+
+      const scrollTargetExists = await page.$(SCROLLABLE_REVIEWS_PANEL_SELECTOR);
+      if (scrollTargetExists) {
+         await page.evaluate((selector) => {
+            const element = document.querySelector(selector);
+            if (element) element.scrollTop = element.scrollHeight;
+         }, SCROLLABLE_REVIEWS_PANEL_SELECTOR);
+      } else {
+          console.warn(`⚠️ Scroll target '${SCROLLABLE_REVIEWS_PANEL_SELECTOR}' not found. Attempting window scroll.`);
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      }
+
       try {
-        await page.screenshot({ path: errorScreenshotPath, fullPage: true });
-        console.log(`Error screenshot saved to ${errorScreenshotPath}`);
+        // FIX for Error 5: Replace waitForTimeout
+        await new Promise(r => setTimeout(r, 2000 + Math.random() * 1000));
+      } catch (e) {
+        console.warn("Timeout during scroll wait, continuing.", e);
+      }
+    }
+    if (scrollAttempts >= maxScrollAttempts) {
+        console.warn("⚠️ Reached max scroll attempts.");
+    }
+    console.log(`✅ Finished scrolling. Extracted ${allExtractedReviews.length} unique reviews.`);
+
+    if (allExtractedReviews.length > 0) {
+      const filePath = 'reviews_output.json';
+      await fs.writeFile(filePath, JSON.stringify(allExtractedReviews, null, 2));
+      console.log(`💾 All reviews saved to ${filePath}`);
+    } else {
+      console.log("💾 No reviews extracted to save.");
+    }
+
+    console.log("🎉 Script completed successfully.");
+
+  } catch (err) {
+    console.error("❌ An error occurred:", err);
+    if (page && !page.isClosed()) {
+      const path = `error_screenshot_${Date.now()}.png`;
+      try {
+        await page.screenshot({ path, fullPage: true });
+        console.log(`📷 Error screenshot saved: ${path}`);
       } catch (screenshotError) {
-        console.error("Failed to take error screenshot:", screenshotError);
+        console.error("⚠️ Failed to capture screenshot:", screenshotError);
       }
     }
   } finally {
-    if (!launchConfig.headless && browser && browser.isConnected()) {
-      console.log(
-        "Script finished or error occurred. Browser will remain open for 20 seconds for inspection..."
-      );
-      await new Promise((resolve) => setTimeout(resolve, 20000)); // Increased for inspection
-    }
     if (browser && browser.isConnected()) {
-      console.log("Closing browser...");
+      if (!launchConfig.headless) {
+        console.log("⏳ Leaving browser open for 10 seconds (adjust as needed)...");
+        await new Promise(res => setTimeout(res, 10000));
+      }
       await browser.close();
-      console.log("Browser closed.");
-    } else {
-      console.log("Browser was not connected or already closed.");
+      console.log("🧹 Browser closed.");
     }
   }
 })();
