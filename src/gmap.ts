@@ -48,7 +48,7 @@ const BATCH_SAVE_SIZE = 10; // Save every 10 new reviews
   }
 
   const launchConfig = {
-    headless: false, // Set to true for CI/production
+    headless: true, // Set to true for CI/production
     args: ["--disable-infobars", "--window-size=1366,768", "--lang=en-US,en"],
   };
 
